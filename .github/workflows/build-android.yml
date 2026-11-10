@@ -2,7 +2,7 @@ name: Build Android
 
 # 在 downstream 分支上手动编译 Android arm64 (aarch64) APK。
 # main 只用来同步上游，不跑这个 workflow。
-# 若仓库配置了 ANDROID_KEY_* secrets，产物会用正式密钥签名；否则上传未签名 APK。
+# 优先用 ANDROID_KEY_* secrets 签名；没配则用临时 debug 密钥，保证 APK 可安装。
 on:
   workflow_dispatch:
 
@@ -86,27 +86,43 @@ jobs:
             exit 1
           fi
 
+          KS="$RUNNER_TEMP/release.keystore"
           if [ -n "${KEYSTORE_BASE64:-}" ]; then
-            KS="$RUNNER_TEMP/release.keystore"
             echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
-            BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
-            APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
-            for f in "${apks[@]}"; do
-              out="artifacts/HGhub_${VERSION}_arm64-v8a.apk"
-              "$APKSIGNER" sign \
-                --ks "$KS" --ks-key-alias "$KEY_ALIAS" \
-                --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
-                --v4-signing-enabled false \
-                --out "$out" "$f"
-              "$APKSIGNER" verify --print-certs "$out" | head -3
-            done
-            rm -f "$KS"
+            ALIAS="${KEY_ALIAS:?ANDROID_KEY_ALIAS is empty}"
+            STORE_PASS="${STORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD is empty}"
+            KEY_PASS="${KEY_PASSWORD:?ANDROID_KEY_PASSWORD is empty}"
           else
-            echo "::warning::未配置 ANDROID_KEY_BASE64，上传未签名 APK"
-            for f in "${apks[@]}"; do
-              cp "$f" "artifacts/HGhub_${VERSION}_arm64-v8a.apk"
-            done
+            echo "::warning::未配置 ANDROID_KEY_*，使用临时 debug 密钥签名（可安装，但每次构建签名不同）"
+            ALIAS="hghub"
+            STORE_PASS="android"
+            KEY_PASS="android"
+            keytool -genkeypair -noprompt \
+              -keystore "$KS" \
+              -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STORE_PASS" -keypass "$KEY_PASS" \
+              -dname "CN=HGhub CI, OU=CI, O=HGhub, C=US"
           fi
+
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          ZIPALIGN="$ANDROID_SDK_ROOT/build-tools/$BT/zipalign"
+          for f in "${apks[@]}"; do
+            aligned="$RUNNER_TEMP/aligned.apk"
+            "$ZIPALIGN" -p -f 4 "$f" "$aligned"
+            out="artifacts/HGhub_${VERSION}_arm64-v8a.apk"
+            "$APKSIGNER" sign \
+              --ks "$KS" --ks-key-alias "$ALIAS" \
+              --ks-pass "pass:$STORE_PASS" --key-pass "pass:$KEY_PASS" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --v4-signing-enabled false \
+              --out "$out" "$aligned"
+            "$APKSIGNER" verify --verbose --print-certs "$out"
+          done
+          rm -f "$KS" "$RUNNER_TEMP/aligned.apk"
           ls -lh artifacts
 
       - name: 上传产物
